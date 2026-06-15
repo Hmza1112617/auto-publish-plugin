@@ -1,0 +1,364 @@
+import traceback
+import time
+import json
+import os
+import threading
+import re
+import random
+from typing import Optional, List, Any
+from datetime import datetime, timedelta
+
+from java import jclass, dynamic_proxy
+from java.util import Locale
+from android.os import Bundle
+from base_plugin import BasePlugin, HookResult, MethodHook, MenuItemData, MenuItemType
+from android_utils import log as drr_log, run_on_ui_thread
+from hook_utils import find_class
+from client_utils import send_message, get_last_fragment, get_messages_controller
+from ui.bulletin import BulletinHelper
+from ui.settings import Header, Input, Switch, Divider, Text, Selector
+from ui.alert import AlertDialogBuilder
+
+__name__        = "نشر تلقائي"
+__description__ = "نشر تلقائي ب اي محادثه تختارها وتكدر تسوي كلشي"
+__id__          = "autopdrr_r2"
+__author__      = "@DRR_R2"
+__version__     = "1.0"
+__min_version__ = "12.2.3"
+__icon__        = "drr_r2"
+
+DRR_DB_NAME = "drr.json"
+DRR_TIME_FORMAT = "%Y-%m-%d %H:%M:%S"
+DRR_HEARTBEAT = 10 
+
+class DRR_Locales:
+    ar = {
+        "settings_header": "اعدادات بلوقن نشر تلقائي| @DRR_R2",
+        "message_label": "نص الرسالة",
+        "interval_label": "الفاصل الزمني",
+        "subtext1": "مثال:\nضوجه\nترويج\nايشي",
+        "subtext2": "صيغ الوقت المدعومة:\nثانية (s)، دقيقة (m)، ساعة (h)\nمثال: 1h30m (ساعة ونصف).",
+        "random_label": "عشوائية التوقيت (Anti-Ban)",
+        "random_not_configured": "إضغط مطولاً للضبط",
+        "random_configured": "النطاق: {range}",
+        "random_dialog_title": "ضبط العشوائية",
+        "random_dialog_hint": "مثال: 1m - 5m",
+        "random_dialog_subtext": "أدخل النطاق (أقل قيمة - أعلى قيمة).\nسيتم إضافة وقت عشوائي بينهما لكل منشور.",
+        "enabled_label": "تفعيل النشر التلقائي",
+        "no_chat_selected": "لم يتم اختيار دردشة!",
+        "error_sending": "خطأ أثناء الإرسال",
+        "invalid_interval": "صيغة الوقت غير صحيحة",
+        "start_sending": "بدأ المحرك العمل..",
+        "stop_sending": "تم إيقاف المحرك.",
+        "empty_message_error": "لا يمكن ترك نص الرسالة فارغاً!",
+        "add_form": "إضافة مهمة جديدة",
+        "remove_form": "حذف هذه المهمة",
+        "form_header": "مهمة نشر",
+        "current_chat": "الدردشة المستهدفة",
+        "chat_not_selected": "غير محدد",
+        "time_at": " الساعة {time}",
+        "time_soon": " (قريباً)",
+        "time_hours_minutes": " (بعد {hours}س و {minutes}د)",
+        "time_minutes": " (بعد {minutes} دقيقة)",
+        "open_settings": "فتح الإعدادات | @DRR_R2",
+        "antidetect_label": "نظام حماية الحساب:",
+        "antidetect_none": "إيقاف",
+        "antidetect_random": "توقيت عشوائي ذكي",
+        "antidetect_add_time": "زيادة زمنية تراكمية",
+        "add_time_label": "الزيادة التراكمية",
+        "add_time_configured": "الإضافة: {value}",
+        "reschedule_title": "تعديل وقت النشر القادم",
+        "reschedule_success": "تم تغيير الموعد إلى {time}",
+        "close_button": "إغلاق",
+        "simvols_limit": "تم قص النص لتجاوزه 35 حرفاً."
+    }
+    default = ar
+
+def drr_translate(key: str) -> str:
+    lang = Locale.getDefault().getLanguage()
+    locale_dict = getattr(DRR_Locales, lang, DRR_Locales.default)
+    return locale_dict.get(key, key)
+
+class DRR_StorageHandler:
+    def __init__(self, directory: str):
+        self.path = os.path.join(directory, DRR_DB_NAME)
+        self.data = {"tasks": {}}
+        self._initialize()
+
+    def _initialize(self):
+        if os.path.exists(self.path):
+            try:
+                with open(self.path, "r", encoding="utf-8") as f:
+                    self.data = json.load(f)
+            except:
+                self.data = {"tasks": {}}
+        else:
+            self._sync()
+
+    def _sync(self):
+        try:
+            with open(self.path, "w", encoding="utf-8") as f:
+                json.dump(self.data, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            drr_log(f"[@DRR_R2] Storage Error: {e}")
+
+    def get_task(self, tid):
+        return self.data.get("tasks", {}).get(tid)
+
+    def set_task(self, tid, val):
+        if "tasks" not in self.data:
+            self.data["tasks"] = {}
+        self.data["tasks"][tid] = val
+        self._sync()
+
+    def delete_task(self, tid):
+        if tid in self.data.get("tasks", {}):
+            del self.data["tasks"][tid]
+            self._sync()
+
+class DRR_DialogsProxy(dynamic_proxy(find_class("org.telegram.ui.DialogsActivity$DialogsActivityDelegate"))):
+    def __init__(self, callback):
+        super().__init__()
+        self.callback = callback
+    def didSelectDialogs(self, fragment, dids, message, param, notify, scheduleDate, topicsFragment, *args):
+        try:
+            self.callback(fragment, dids)
+        except Exception as e:
+            BulletinHelper.show_error(f"{e}")
+
+class DRR_UltraPublish(BasePlugin):
+    def __init__(self):
+        super().__init__()
+        self.engine_alive = False
+        self.storage = None
+        self.lock = threading.Lock()
+        self.alert = DRR_AlertHelper()
+
+    def on_plugin_load(self):
+        plugin_dir = os.path.dirname(os.path.realpath(__file__))
+        self.storage = DRR_StorageHandler(plugin_dir)
+        self._setup_menu()
+        self._start_engine()
+        drr_log("[@DRR_R2] Ultra Publish v4.1 Loaded Successfully.")
+
+    def on_plugin_unload(self):
+        self.engine_alive = False
+        drr_log("[@DRR_R2] Plugin Unloaded.")
+
+    def _setup_menu(self):
+        self.add_menu_item(MenuItemData(
+            menu_type=MenuItemType.DRAWER_MENU,
+            text=__name__,
+            subtext=drr_translate("open_settings"),
+            icon="msg_bot",
+            on_click=lambda c: find_class("com.exteragram.messenger.plugins.PluginsController").openPluginSettings(__id__)
+        ))
+
+    def _start_engine(self):
+        if self.engine_alive:
+            return
+        self.engine_alive = True
+        def _loop():
+            while self.engine_alive:
+                try:
+                    self._process_tasks()
+                except:
+                    drr_log(f"[@DRR_R2_CRITICAL] {traceback.format_exc()}")
+                time.sleep(DRR_HEARTBEAT)
+        threading.Thread(target=_loop, daemon=True).start()
+
+    def _process_tasks(self):
+        now = datetime.now()
+        ui_tasks = self._get_ui_tasks()
+        with self.lock:
+            cached_tasks = dict(self.storage.data.get("tasks", {}))
+
+        for tid, cache_data in cached_tasks.items():
+            next_run_str = cache_data.get("next_run")
+            if not next_run_str:
+                continue
+            
+            try:
+                scheduled = datetime.strptime(next_run_str, DRR_TIME_FORMAT)
+            except:
+                continue
+
+            task = next((t for t in ui_tasks if t.get("id") == tid), None)
+            if not task or not task.get("enabled"):
+                continue
+
+            if now >= scheduled:
+                cid, msg = cache_data.get("chat_id"), cache_data.get("message")
+                if cid and msg:
+                    try:
+                        send_message({"peer": int(cid), "message": msg})
+                        drr_log(f"[@DRR_R2] Published task {tid} to {cid}")
+                    except Exception as e:
+                        drr_log(f"[@DRR_R2] Send Error: {e}")
+
+                interval = self._parse_time(task.get("interval", ""))
+                if interval > 0:
+                    mode = task.get("antidetect_mode", 0)
+                    if mode == 1 and task.get("random_enabled"):
+                        parsed_range = self._parse_range(task.get("random_range", ""))
+                        interval += random.randint(parsed_range[0], parsed_range[1]) if parsed_range else 60
+                    elif mode == 2 and task.get("add_time_enabled"):
+                        add_sec = self._parse_time(task.get("add_time_value", ""))
+                        acc = cache_data.get("add_time_acc", 0) + add_sec
+                        cache_data["add_time_acc"] = acc
+                        interval += acc
+
+                    cache_data["next_run"] = (now + timedelta(seconds=interval)).strftime(DRR_TIME_FORMAT)
+                    self.storage.set_task(tid, cache_data)
+        
+        run_on_ui_thread(lambda: self.set_setting("_drr_tick", str(time.time()), reload_settings=True))
+
+    def create_settings(self):
+        tasks = self._get_ui_tasks()
+        if not tasks:
+            self._add_task()
+            tasks = self._get_ui_tasks()
+
+        ui = [Header(text=drr_translate("settings_header"))]
+        ui.append(Text(text=drr_translate("add_form"), icon="msg_addbot", on_click=lambda v: self._add_task()))
+        ui.append(Divider())
+
+        for idx, t in enumerate(tasks):
+            tid = t["id"]
+            is_on = t.get("enabled", False)
+            is_collapsed = t.get("collapsed", False)
+
+            time_label = ""
+            with self.lock:
+                c_info = self.storage.get_task(tid) or {}
+            
+            if is_on and c_info.get("next_run"):
+                try:
+                    dt = datetime.strptime(c_info["next_run"], DRR_TIME_FORMAT)
+                    diff = (dt - datetime.now()).total_seconds()
+                    if diff > 0:
+                        time_label = drr_translate("time_at").format(time=dt.strftime("%H:%M"))
+                except:
+                    pass
+
+            header_txt = f"{drr_translate('form_header')} #{idx+1} {time_label}"
+            ui.append(Text(
+                text=header_txt,
+                icon="msg_go_up" if not is_collapsed else "arrow_more_solar",
+                accent=is_on,
+                on_click=self._toggle_task_view(idx),
+                on_long_click=lambda v, _tid=tid: self._show_reschedule(_tid)
+            ))
+
+            if not is_collapsed:
+                ui.extend([
+                    Switch(key=f"en_{tid}", text=drr_translate("enabled_label"), default=is_on, on_change=lambda v, i=idx: self._handle_toggle(i, v)),
+                    Input(key=f"msg_{tid}", text=drr_translate("message_label"), default=t["message"], subtext=drr_translate("subtext1"), on_change=lambda v, i=idx: self._update_field(i, "message", v)),
+                    Input(key=f"int_{tid}", text=drr_translate("interval_label"), default=t["interval"], subtext=drr_translate("subtext2"), on_change=lambda v, i=idx: self._update_field(i, "interval", v)),
+                    Selector(key=f"prot_{tid}", text=drr_translate("antidetect_label"), default=t.get("antidetect_mode", 0), items=[drr_translate("antidetect_none"), drr_translate("antidetect_random"), drr_translate("antidetect_add_time")], on_change=lambda v, i=idx: self._change_proto(i, v)),
+                    Text(text=f"{drr_translate('current_chat')}: {t['chat_title']}", icon="ic_chatlist_add_2_solar", on_click=lambda v, i=idx: self._pick_chat(i)),
+                    Text(text=drr_translate("remove_form"), icon="msg_delete", red=True, on_click=lambda v, i=idx: self._remove_task(idx))
+                ])
+                ui.append(Divider())
+
+        ui.append(Header(text="برمجة وتطوير @DRR_R2"))
+        return ui
+
+    def _get_ui_tasks(self):
+        try:
+            return json.loads(self.get_setting("drr_tasks_v4", "[]"))
+        except:
+            return []
+
+    def _add_task(self):
+        ts = self._get_ui_tasks()
+        tid = f"drr_{int(time.time()*1000)}"
+        ts.append({"id": tid, "message": "", "interval": "1h", "chat_title": drr_translate("chat_not_selected"), "enabled": False, "collapsed": False, "antidetect_mode": 0})
+        self.set_setting("drr_tasks_v4", json.dumps(ts), reload_settings=True)
+        self.storage.set_task(tid, {"next_run": None, "message": "", "chat_id": ""})
+
+    def _update_field(self, idx, field, val):
+        ts = self._get_ui_tasks()
+        ts[idx][field] = str(val).strip()
+        self.set_setting("drr_tasks_v4", json.dumps(ts))
+        self.storage.set_task(ts[idx]["id"], {**self.storage.get_task(ts[idx]["id"]), field: ts[idx][field]})
+
+    def _handle_toggle(self, idx, state):
+        ts = self._get_ui_tasks()
+        task = ts[idx]
+        if state and (not task["message"] or task["chat_title"] == drr_translate("chat_not_selected")):
+            run_on_ui_thread(lambda: BulletinHelper.show_error(drr_translate("no_chat_selected")))
+            self.set_setting(f"en_{task['id']}", False, reload_settings=True)
+            return
+        task["enabled"] = state
+        self.set_setting("drr_tasks_v4", json.dumps(ts))
+        
+        info = self.storage.get_task(task["id"])
+        if state:
+            sec = self._parse_time(task["interval"])
+            info["next_run"] = (datetime.now() + timedelta(seconds=sec)).strftime(DRR_TIME_FORMAT)
+            info["add_time_acc"] = 0
+            threading.Thread(target=lambda: send_message({"peer": int(info["chat_id"]), "message": task["message"]}), daemon=True).start()
+        else:
+            info["next_run"] = None
+        self.storage.set_task(task["id"], info)
+        run_on_ui_thread(lambda: BulletinHelper.show_info(drr_translate("start_sending") if state else drr_translate("stop_sending")))
+
+    def _pick_chat(self, idx):
+        def _go():
+            Bundle_Cls = jclass("android.os.Bundle")
+            args = Bundle_Cls()
+            args.putBoolean("onlySelect", True)
+            Dialogs_Cls = find_class("org.telegram.ui.DialogsActivity")
+            activity = Dialogs_Cls(args)
+            def _done(frag, dids):
+                frag.finishFragment()
+                if not dids.isEmpty():
+                    did = dids.get(0).dialogId
+                    ts = self._get_ui_tasks()
+                    ts[idx]["chat_id"] = str(did)
+                    ts[idx]["chat_title"] = f"ID: {did}"
+                    self.set_setting("drr_tasks_v4", json.dumps(ts), reload_settings=True)
+                    self.storage.set_task(ts[idx]["id"], {**self.storage.get_task(ts[idx]["id"]), "chat_id": str(did)})
+            activity.setDelegate(DRR_DialogsProxy(_done))
+            get_last_fragment().presentFragment(activity)
+        run_on_ui_thread(_go)
+
+    def _remove_task(self, idx):
+        ts = self._get_ui_tasks()
+        tid = ts.pop(idx)["id"]
+        self.set_setting("drr_tasks_v4", json.dumps(ts), reload_settings=True)
+        self.storage.delete_task(tid)
+
+    def _toggle_task_view(self, idx):
+        def _exec(v):
+            ts = self._get_ui_tasks()
+            ts[idx]["collapsed"] = not ts[idx].get("collapsed", False)
+            self.set_setting("drr_tasks_v4", json.dumps(ts), reload_settings=True)
+        return _exec
+
+    def _parse_time(self, s):
+        res = re.findall(r'(\d+)([hmds])', str(s).lower())
+        total = 0
+        mult = {'h': 3600, 'm': 60, 's': 1, 'd': 86400}
+        for v, u in res: 
+            total += int(v) * mult.get(u, 0)
+        return total if total > 0 else 0
+
+    def _parse_range(self, r):
+        m = re.match(r'^(\d+[smh])-(\d+[smh])$', str(r).replace(" ",""))
+        if m: 
+            return (self._parse_time(m.group(1)), self._parse_time(m.group(2)))
+        return None
+
+class DRR_AlertHelper:
+    def show_info(self, title, msg):
+        def _ui():
+            ctx = get_last_fragment().getParentActivity()
+            b = AlertDialogBuilder(ctx)
+            b.set_title(title).set_message(msg).set_positive_button(drr_translate("close_button"), None).show()
+        run_on_ui_thread(_ui)
+
+class DRR_AlertManager:
+    def __init__(self): 
+        self.instance = None
